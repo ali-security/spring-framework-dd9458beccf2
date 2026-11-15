@@ -20,6 +20,10 @@ inputs:
     description: 'Java version to compile and test with'
     required: false
     default: '25'
+  test-filter:
+    description: 'Gradle test task selector; when set, only the selected tests run'
+    required: false
+    default: ''
   publish:
     description: 'Whether to publish artifacts ready for deployment to Artifactory'
     required: false
@@ -46,7 +50,12 @@ runs:
       id: build
       if: ${{ inputs.publish == 'false' }}
       shell: bash
-      run: ./gradlew check antora
+      run: |
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          ./gradlew ${{ inputs.test-filter }}
+        else
+          ./gradlew check antora
+        fi
     - name: Publish
       id: publish
       if: ${{ inputs.publish == 'true' }}

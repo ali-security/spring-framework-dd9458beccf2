@@ -1,19 +1,45 @@
 name: Build Pull Request
-on: pull_request
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test task selector (empty runs the full suite)'
+        required: false
+        default: ''
 permissions:
   contents: read
 jobs:
   build:
     name: Build Pull Request
-    if: ${{ github.repository == 'spring-projects/spring-framework' }}
+    if: ${{ true }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 50
     steps:
       - name: Check Out Code
         uses: actions/checkout@v6
       - name: Build
         id: build
         uses: ./.github/actions/build
+        with:
+          test-filter: ${{ inputs.test-filter }}
+      - name: Build spring-webflux Jar
+        run: ./gradlew :spring-webflux:jar
+      - name: Upload spring-webflux Jar
+        uses: actions/upload-artifact@v6
+        with:
+          name: spring-webflux-jar
+          path: spring-webflux/build/libs/spring-webflux-*.jar
+          if-no-files-found: error
+      - name: Pack Test Results
+        if: ${{ !cancelled() }}
+        run: find . -path '*/build/test-results/*' -name 'TEST-*.xml' -print0 | tar --null -czf test-results.tgz --files-from=-
+      - name: Upload Test Results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-results
+          path: test-results.tgz
+          if-no-files-found: error
       - name: Print JVM Thread Dumps When Cancelled
         if: cancelled()
         uses: ./.github/actions/print-jvm-thread-dumps
@@ -23,3 +49,143 @@ jobs:
         with:
           name: build-reports
           path: '**/build/reports/'
+
+  test-report:
+    name: Test Report
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check Out Code
+        uses: actions/checkout@v6
+      - name: Download Test Results
+        uses: actions/download-artifact@v7
+        with:
+          name: test-results
+      - name: Print Test Summary
+        shell: python3 {0}
+        run: |
+          import glob, collections, os, re, tarfile
+          import xml.etree.ElementTree as ET
+          tarfile.open('test-results.tgz').extractall('.')
+          COND = re.compile(r'@(Disabled\w*|Enabled\w*|Ignore|IfProfileValue)\b[^/]*(//.*)?')
+          srcs = collections.defaultdict(list)
+          for f in glob.glob('**/src/test/**/*.java', recursive=True) + glob.glob('**/src/test/**/*.kt', recursive=True):
+              srcs[os.path.splitext(os.path.basename(f))[0]].append(f)
+          cache = {}
+          def read(f):
+              if f not in cache:
+                  cache[f] = open(f, encoding='utf-8', errors='replace').read().split('\n')
+              return cache[f]
+          def annot_above(ls, i):
+              j = i
+              found = []
+              while j >= 0:
+                  t = ls[j].strip()
+                  if j < i and not (t.startswith('@') or t.startswith('//') or t.startswith('*') or t.startswith('/*') or t.startswith('"') or t == ''):
+                      break
+                  m = COND.search(ls[j])
+                  if m:
+                      found.insert(0, m.group(0).strip())
+                  j -= 1
+              return ' '.join(found) or None
+          def class_assumes(ls):
+              al = [b.strip() for b in ls if re.search(r'\bassume\w*\(', b) and not re.search(r'^\s*import|\bvoid\b', b)]
+              return ('runtime environment assumption (not met on the ubuntu-latest/JDK 25 runner upstream CI also uses), one of `' + ' | '.join(al[:3]) + '`') if al else None
+          def files_for(cls):
+              simple = cls.split('.')[-1].split('$')[0]
+              fs = srcs.get(simple, [])
+              pkg = '/'.join(cls.split('$')[0].split('.')[:-1])
+              exact = [f for f in fs if pkg and ('/' + pkg + '/') in f]
+              return exact or fs
+          def class_reason(cls, depth=0):
+              simple = cls.split('.')[-1].split('$')[0]
+              for f in files_for(cls):
+                  ls = read(f)
+                  for n in [cls.split('$')[-1].split('.')[-1], simple]:
+                      for i, l in enumerate(ls):
+                          if re.search(r'\bclass\s+' + re.escape(n) + r'\b', l):
+                              a = annot_above(ls, i - 1)
+                              if a:
+                                  return 'class annotation `' + a + '`' + (' (inherited)' if depth else '')
+                              ext = re.search(r'\bextends\s+([\w.]+)', l)
+                              if ext and depth < 3:
+                                  r = class_reason(ext.group(1), depth + 1)
+                                  if r:
+                                      return r
+                  r = class_assumes(ls)
+                  if r:
+                      return r
+              return None
+          def source_reason(cls, method):
+              files = files_for(cls)
+              mname = re.sub(r'[\(\[].*', '', method).strip()
+              pat = re.compile(r'\b(void|fun)\s+' + re.escape(mname) + r'\s*\(') if mname else None
+              cand = list(files)
+              if pat:
+                  cand += [f for fs in srcs.values() for f in fs if f not in files]
+              for f in cand:
+                  ls = read(f)
+                  if not pat:
+                      break
+                  for i, l in enumerate(ls):
+                      if pat.search(l):
+                          a = annot_above(ls, i)
+                          if a:
+                              return 'method annotation `' + a + '`'
+                          for b in ls[i:i + 40]:
+                              if re.search(r'\bassume\w*\(', b):
+                                  return 'runtime assumption (not met on this runner) `' + b.strip() + '`'
+                          break
+                  else:
+                      continue
+                  break
+              return class_reason(cls)
+          def norm(reason):
+              m = re.match(r'(method|class) annotation `@(EnabledIf|DisabledIf)\(', reason)
+              if m:
+                  return 'spring-test @' + m.group(2) + ' self-tests whose expression deliberately evaluates to disabled'
+              return reason
+          mods = collections.OrderedDict()
+          skips = collections.defaultdict(list)
+          fails = []
+          for f in sorted(glob.glob('**/build/test-results/*/TEST-*.xml', recursive=True)):
+              mod = f.split('/build/')[0].lstrip('./')
+              r = ET.parse(f).getroot()
+              m = mods.setdefault(mod, [0, 0, 0, 0])
+              t, fl, e, sk = (int(r.get(k, 0)) for k in ('tests', 'failures', 'errors', 'skipped'))
+              m[0] += t; m[1] += fl; m[2] += e; m[3] += sk
+              for tc in r.iter('testcase'):
+                  cls = tc.get('classname', '')
+                  meth = tc.get('name', '')
+                  if cls.startswith('Gradle Test Run'):
+                      cls, meth = meth, ''
+                  name = cls.split('.')[-1] + ('.' + meth.split('(')[0] if meth else '')
+                  s = tc.find('skipped')
+                  if s is not None:
+                      msg = (s.get('message') or (s.text or '').strip() or '').split('\n')[0]
+                      msg = msg.replace('org.opentest4j.TestAbortedException: ', '').replace('org.junit.AssumptionViolatedException: ', 'JUnit4 assumption: ')[:140]
+                      if not msg or msg.rstrip(' :').endswith('due to'):
+                          msg = source_reason(cls, meth) or msg or 'disabled (no reason recorded)'
+                      skips[norm(msg)].append(name)
+                  if tc.find('failure') is not None or tc.find('error') is not None:
+                      fails.append(name)
+          tot = [0, 0, 0, 0]
+          print('=== Per-module test results ===')
+          for mod, m in mods.items():
+              print(f'{mod}: Tests run: {m[0]}, Passed: {m[0]-m[1]-m[2]-m[3]}, Failures: {m[1]}, Errors: {m[2]}, Skipped: {m[3]}')
+              tot = [a + b for a, b in zip(tot, m)]
+          print('=== Skipped tests grouped by reason ([count] reason: tests) ===')
+          for reason, names in sorted(skips.items(), key=lambda kv: -len(kv[1])):
+              uniq = list(dict.fromkeys(names))
+              byc = collections.OrderedDict()
+              for n in uniq:
+                  c, _, mm = n.partition('.')
+                  byc.setdefault(c, []).append(mm)
+              shown = '; '.join(c + (('.{' + ','.join(ms) + '}') if any(ms) else '') for c, ms in byc.items())
+              print(f'[{len(names)}] {reason}: {shown}')
+          if fails:
+              print('=== Failed tests ===')
+              for n in fails: print(n)
+          print(f'=== TOTAL: Tests run: {tot[0]}, Passed: {tot[0]-tot[1]-tot[2]-tot[3]}, Failures: {tot[1]}, Errors: {tot[2]}, Skipped: {tot[3]} ===')
